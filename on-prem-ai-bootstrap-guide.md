@@ -229,19 +229,15 @@ Model weights need to be available on the node. For an air-gapped or on-prem env
 sudo mkdir -p /models
 sudo chown $(id -u):$(id -g) /models
 
-# Install huggingface-cli
-pip install huggingface_hub
+# Install huggingface CLI (using pipx to avoid system Python conflicts)
+pipx install huggingface-hub
 
 # Download Codestral 22B (or your model of choice)
 # NOTE: Some models require accepting license terms on huggingface.co first
-huggingface-cli download mistralai/Codestral-22B-v0.1 \
-  --local-dir /models/codestral-22b \
-  --local-dir-use-symlinks False
+hf download mistralai/Codestral-22B-v0.1 --local-dir /models/codestral-22b
 
 # For a smaller test model (if GPU is limited):
-huggingface-cli download Qwen/Qwen2.5-Coder-7B-Instruct \
-  --local-dir /models/qwen-coder-7b \
-  --local-dir-use-symlinks False
+hf download Qwen/Qwen2.5-Coder-7B-Instruct --local-dir /models/qwen-coder-7b
 ```
 
 ### 5.2 Create a Persistent Volume for Models
