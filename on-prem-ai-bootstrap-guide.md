@@ -182,12 +182,35 @@ kubectl describe node | grep -A 5 "nvidia.com/gpu"
 #   nvidia.com/gpu: 1    (or however many GPUs you have)
 ```
 
+> **Troubleshooting**: If the device plugin logs show `could not load NVML library: libnvidia-ml.so.1: cannot open shared object file`, the plugin needs to run with the NVIDIA runtime. K3s auto-creates an `nvidia` RuntimeClass, but the device plugin doesn't use it by default. Apply this fix:
+>
+> ```bash
+> # Patch the device plugin to use the nvidia RuntimeClass
+> kubectl -n kube-system patch daemonset nvidia-device-plugin-daemonset \
+>   --type='json' \
+>   -p='[{"op": "add", "path": "/spec/template/spec/runtimeClassName", "value": "nvidia"}]'
+>
+> # Wait for the pod to restart, then verify
+> sleep 15
+> kubectl describe node | grep -A 5 "nvidia.com/gpu"
+> ```
+
 ### 4.4 Quick GPU Test
 
 ```bash
 kubectl run gpu-test --rm -it --restart=Never \
   --image=nvidia/cuda:12.3.1-base-ubuntu22.04 \
-  --limits=nvidia.com/gpu=1 \
+  --overrides='{
+    "spec": {
+      "runtimeClassName": "nvidia",
+      "containers": [{
+        "name": "gpu-test",
+        "image": "nvidia/cuda:12.3.1-base-ubuntu22.04",
+        "command": ["nvidia-smi"],
+        "resources": {"limits": {"nvidia.com/gpu": "1"}}
+      }]
+    }
+  }' \
   -- nvidia-smi
 
 # Should print the nvidia-smi output and exit
