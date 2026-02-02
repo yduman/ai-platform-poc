@@ -71,6 +71,48 @@ PV (admin creates)          PVC (pod requests)           Pod
 
 The separation exists so pods don't need to know where storage actually lives — they just claim what they need, and Kubernetes figures out the binding.
 
+### Deployment
+
+Deployment — A controller that manages Pods. Instead of creating Pods directly, you declare "I want N replicas of this Pod template" and the Deployment ensures that state is maintained.
+
+Pod — The smallest deployable unit. A Pod wraps one or more containers that share network/storage and are scheduled together.
+
+```
+Deployment                        ReplicaSet                         Pods
+┌──────────────────┐            ┌──────────────────┐            ┌─────────────┐
+│ replicas: 1      │───creates──│ manages pod      │───creates──│ vllm        │
+│ template: {...}  │            │ lifecycle        │            │ container   │
+│ strategy: ...    │            │                  │            └─────────────┘
+└──────────────────┘            └──────────────────┘
+```
+
+- Deployment defines the desired state (image, replicas, resources, probes)
+- ReplicaSet is created automatically — it ensures the right number of Pods exist
+- If a Pod dies, the ReplicaSet spins up a replacement
+- Deployments handle rolling updates: change the image → new ReplicaSet → old Pods gradually replaced
+
+Why not create Pods directly? Pods are mortal — if one crashes or gets evicted, it's gone. Deployments give you self-healing and declarative updates.
+
+### Service
+
+Service — A stable network endpoint for accessing Pods. Pods get random IPs that change when they restart. A Service provides a fixed DNS name and IP that routes to healthy Pods.
+
+```
+Client                          Service                           Pods
+┌──────────────┐              ┌──────────────────┐            ┌─────────────┐
+│ curl         │───request───►│ vllm-qwen25-...  │───routes───│ Pod IP      │
+│ svc:8000     │              │ ClusterIP        │    to      │ 10.x.x.x    │
+└──────────────┘              │ selector: app=.. │            └─────────────┘
+                              └──────────────────┘
+```
+
+- Service uses a `selector` to find Pods (e.g., `app: vllm-qwen25-coder-7b`)
+- ClusterIP (default) — only accessible within the cluster
+- NodePort — exposes on each node's IP at a static port
+- LoadBalancer — provisions external load balancer (cloud providers)
+
+The Service acts as an internal load balancer. Even with 1 replica, it provides a stable DNS name (`vllm-qwen25-coder-7b.ai-platform.svc.cluster.local`) so other services don't need to track Pod IPs.
+
 ## vLLM
 
 ### KV Cache
