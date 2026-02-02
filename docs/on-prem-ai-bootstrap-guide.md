@@ -232,12 +232,16 @@ sudo chown $(id -u):$(id -g) /models
 # Install huggingface CLI (using pipx to avoid system Python conflicts)
 pipx install huggingface-hub
 
-# Download Codestral 22B (or your model of choice)
-# NOTE: Some models require accepting license terms on huggingface.co first
-hf download mistralai/Codestral-22B-v0.1 --local-dir /models/codestral-22b
+# Download Qwen 2.5 Coder 7B AWQ (recommended for 16GB GPUs)
+# AWQ quantization reduces model size from ~14GB to ~5GB
+hf download Qwen/Qwen2.5-Coder-7B-Instruct-AWQ --local-dir /models/qwen-coder-7b-awq
 
-# For a smaller test model (if GPU is limited):
-hf download Qwen/Qwen2.5-Coder-7B-Instruct --local-dir /models/qwen-coder-7b
+# Alternative: Full precision model (requires ~14GB free VRAM, no desktop apps)
+# hf download Qwen/Qwen2.5-Coder-7B-Instruct --local-dir /models/qwen-coder-7b
+
+# For larger GPUs (48GB+): Codestral 22B
+# NOTE: Requires accepting license terms on huggingface.co first
+# hf download mistralai/Codestral-22B-v0.1 --local-dir /models/codestral-22b
 ```
 
 ### 5.2 Create a Persistent Volume for Models
@@ -278,44 +282,47 @@ kubectl apply -f vllm-model-pv.yaml
 
 ### 5.3 Deploy vLLM
 
+> **Note**: If you're running a desktop environment (Xorg, Cinnamon, etc.), GUI apps consume GPU memory (often 2-4GB). Use the AWQ-quantized model and lower memory settings below. Check usage with `nvidia-smi`.
+
 ```yaml
 # Save as: vllm-deployment.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: vllm-codestral
+  name: vllm-qwen
   namespace: ai-platform
   labels:
-    app: vllm-codestral
+    app: vllm-qwen
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: vllm-codestral
+      app: vllm-qwen
   template:
     metadata:
       labels:
-        app: vllm-codestral
+        app: vllm-qwen
     spec:
+      runtimeClassName: nvidia
       containers:
         - name: vllm
-          image: vllm/vllm-openai:latest
+          image: vllm/vllm-openai:v0.6.3.post1    # Pin version for stability
           args:
             - "--model"
-            - "/models/codestral-22b"
+            - "/models/qwen-coder-7b-awq"         # Use AWQ quantized model
             - "--served-model-name"
-            - "codestral"
+            - "qwen-coder"
             - "--host"
             - "0.0.0.0"
             - "--port"
             - "8000"
             - "--max-model-len"
-            - "16384"
+            - "8192"                              # Reduce if OOM (uses less KV cache)
+            - "--quantization"
+            - "awq"
             - "--gpu-memory-utilization"
-            - "0.90"
-            # Uncomment for quantized models:
-            # - "--quantization"
-            # - "awq"
+            - "0.70"                              # Lower if desktop apps use GPU
+            - "--enforce-eager"                   # Disable CUDA graphs (saves 1-3GB)
             # Uncomment for multi-GPU:
             # - "--tensor-parallel-size"
             # - "2"
@@ -324,7 +331,7 @@ spec:
               name: http
           resources:
             limits:
-              nvidia.com/gpu: 1
+              nvidia.com/gpu: "1"
           volumeMounts:
             - name: model-volume
               mountPath: /models
@@ -355,11 +362,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: vllm-codestral
+  name: vllm-qwen
   namespace: ai-platform
 spec:
   selector:
-    app: vllm-codestral
+    app: vllm-qwen
   ports:
     - port: 8000
       targetPort: 8000
@@ -371,27 +378,27 @@ spec:
 kubectl apply -f vllm-deployment.yaml
 
 # Watch the pod come up (model loading can take 2-5 minutes)
-kubectl -n ai-platform logs -f deployment/vllm-codestral
+kubectl -n ai-platform logs -f deployment/vllm-qwen
 
 # Wait for ready
-kubectl -n ai-platform wait --for=condition=available deployment/vllm-codestral --timeout=300s
+kubectl -n ai-platform wait --for=condition=available deployment/vllm-qwen --timeout=300s
 ```
 
 ### 5.4 Verify vLLM is Serving
 
 ```bash
 # Port-forward to test locally
-kubectl -n ai-platform port-forward svc/vllm-codestral 8000:8000 &
+kubectl -n ai-platform port-forward svc/vllm-qwen 8000:8000 &
 
 # Test the endpoint
 curl http://localhost:8000/v1/models
-# Should return: {"data": [{"id": "codestral", ...}]}
+# Should return: {"data": [{"id": "qwen-coder", ...}]}
 
 # Test a completion
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "codestral",
+    "model": "qwen-coder",
     "messages": [{"role": "user", "content": "Write a Python hello world"}],
     "max_tokens": 100
   }'
@@ -416,17 +423,17 @@ metadata:
 data:
   config.yaml: |
     model_list:
-      - model_name: codestral
+      - model_name: qwen-coder
         litellm_params:
-          model: openai/codestral
-          api_base: http://vllm-codestral.ai-platform.svc.cluster.local:8000/v1
+          model: openai/qwen-coder
+          api_base: http://vllm-qwen.ai-platform.svc.cluster.local:8000/v1
           api_key: "none"                # vLLM doesn't need a key internally
 
     # If you add more models later, add them here:
-    # - model_name: qwen-thinking
+    # - model_name: codestral
     #   litellm_params:
-    #     model: openai/qwen3-thinking
-    #     api_base: http://vllm-qwen.ai-platform.svc.cluster.local:8000/v1
+    #     model: openai/codestral
+    #     api_base: http://vllm-codestral.ai-platform.svc.cluster.local:8000/v1
     #     api_key: "none"
 
     litellm_settings:
@@ -586,7 +593,7 @@ curl $LITELLM_URL/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-your-master-key-change-this" \
   -d '{
-    "model": "codestral",
+    "model": "qwen-coder",
     "messages": [{"role": "user", "content": "Write a Python hello world"}],
     "max_tokens": 100
   }'
@@ -600,7 +607,7 @@ curl $LITELLM_URL/key/generate \
   -H "Authorization: Bearer sk-your-master-key-change-this" \
   -H "Content-Type: application/json" \
   -d '{
-    "models": ["codestral"],
+    "models": ["qwen-coder"],
     "user_id": "developer-alice",
     "max_budget": 100,
     "metadata": {"team": "backend"}
@@ -635,8 +642,8 @@ Create a configuration file at `~/.config/opencode/config.json`:
     "baseUrl": "http://<node-ip>:30400/v1"
   },
   "model": {
-    "main": "codestral",
-    "weak": "codestral"
+    "main": "qwen-coder",
+    "weak": "qwen-coder"
   }
 }
 ```
@@ -666,7 +673,7 @@ opencode
 
 # OpenCode should:
 # 1. Send request to LiteLLM (http://<node-ip>:30400/v1)
-# 2. LiteLLM routes to vLLM (codestral)
+# 2. LiteLLM routes to vLLM (qwen-coder)
 # 3. vLLM runs inference on GPU
 # 4. Response streams back through the chain
 ```
@@ -844,7 +851,7 @@ At this point all components should be running. Here is how to verify the full s
 ```bash
 kubectl -n ai-platform get pods
 # NAME                              READY   STATUS    RESTARTS   AGE
-# vllm-codestral-xxxxxxxxx-xxxxx    1/1     Running   0          10m
+# vllm-qwen-xxxxxxxxx-xxxxx         1/1     Running   0          10m
 # litellm-xxxxxxxxx-xxxxx           1/1     Running   0          5m
 ```
 
@@ -852,7 +859,7 @@ kubectl -n ai-platform get pods
 
 ```bash
 # Step 1: Verify vLLM directly
-kubectl -n ai-platform port-forward svc/vllm-codestral 8000:8000 &
+kubectl -n ai-platform port-forward svc/vllm-qwen 8000:8000 &
 curl -s http://localhost:8000/v1/models | jq .
 kill %1
 
@@ -862,7 +869,7 @@ curl -s $LITELLM_URL/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-your-master-key-change-this" \
   -d '{
-    "model": "codestral",
+    "model": "qwen-coder",
     "messages": [{"role": "user", "content": "Write a Python function that adds two numbers"}],
     "max_tokens": 200
   }' | jq '.choices[0].message.content'
@@ -913,7 +920,7 @@ opencode "Add a multiply function and write a test for all three functions"
 
 ```bash
 # Check logs
-kubectl -n ai-platform logs deployment/vllm-codestral
+kubectl -n ai-platform logs deployment/vllm-qwen
 
 # Common issues:
 # "CUDA out of memory" → Model too large for GPU. Use quantization or smaller model.
@@ -926,10 +933,10 @@ kubectl -n ai-platform logs deployment/vllm-codestral
 ```bash
 # Test DNS resolution inside the cluster
 kubectl -n ai-platform run debug --rm -it --image=curlimages/curl -- \
-  curl http://vllm-codestral.ai-platform.svc.cluster.local:8000/v1/models
+  curl http://vllm-qwen.ai-platform.svc.cluster.local:8000/v1/models
 
 # If DNS fails, check the service exists:
-kubectl -n ai-platform get svc vllm-codestral
+kubectl -n ai-platform get svc vllm-qwen
 ```
 
 ### OpenCode Gets Timeout or Connection Refused
@@ -965,7 +972,7 @@ kubectl -n kube-system delete pod -l name=nvidia-device-plugin-ds
 This is normal on first start — large models take 2-5 minutes to load into GPU memory. Once loaded, inference is fast. Check progress in vLLM logs:
 
 ```bash
-kubectl -n ai-platform logs -f deployment/vllm-codestral | grep -i "loading\|ready\|error"
+kubectl -n ai-platform logs -f deployment/vllm-qwen | grep -i "loading\|ready\|error"
 ```
 
 ---
@@ -988,16 +995,16 @@ Once this baseline is working, here is what to add next.
 # Configure ~/.continue/config.json to point at your LiteLLM:
 {
   "models": [{
-    "title": "Codestral",
+    "title": "Qwen Coder",
     "provider": "openai",
-    "model": "codestral",
+    "model": "qwen-coder",
     "apiBase": "http://<node-ip>:30400/v1",
     "apiKey": "sk-your-developer-key"
   }],
   "tabAutocompleteModel": {
-    "title": "Codestral FIM",
+    "title": "Qwen Coder FIM",
     "provider": "openai",
-    "model": "codestral",
+    "model": "qwen-coder",
     "apiBase": "http://<node-ip>:30400/v1",
     "apiKey": "sk-your-developer-key"
   }
@@ -1024,16 +1031,16 @@ Set up MCP servers for Jira, Confluence, and GitLab so that coding agents and Li
 |------|-------------|
 | K3s status | `sudo systemctl status k3s` |
 | All AI pods | `kubectl -n ai-platform get pods` |
-| vLLM logs | `kubectl -n ai-platform logs -f deploy/vllm-codestral` |
+| vLLM logs | `kubectl -n ai-platform logs -f deploy/vllm-qwen` |
 | LiteLLM logs | `kubectl -n ai-platform logs -f deploy/litellm` |
 | LiteLLM health | `curl http://<node-ip>:30400/health/liveliness` |
-| vLLM health | `kubectl -n ai-platform port-forward svc/vllm-codestral 8000:8000` then `curl localhost:8000/health` |
+| vLLM health | `kubectl -n ai-platform port-forward svc/vllm-qwen 8000:8000` then `curl localhost:8000/health` |
 | List models | `curl -H "Authorization: Bearer <key>" http://<node-ip>:30400/v1/models` |
 | Generate API key | `curl -X POST http://<node-ip>:30400/key/generate -H "Authorization: Bearer <master-key>" -d '{"user_id":"alice"}'` |
-| Restart vLLM | `kubectl -n ai-platform rollout restart deploy/vllm-codestral` |
+| Restart vLLM | `kubectl -n ai-platform rollout restart deploy/vllm-qwen` |
 | Restart LiteLLM | `kubectl -n ai-platform rollout restart deploy/litellm` |
 
 ---
 
 *Last updated: February 2026*
-*Architecture version: 1.0 — Single node K3s with Codestral on vLLM*
+*Architecture version: 1.0 — Single node K3s with Qwen Coder on vLLM*

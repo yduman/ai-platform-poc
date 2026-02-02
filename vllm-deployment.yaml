@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-qwen25-coder-7b
+  namespace: ai-platform
+  labels:
+    app: vllm-qwen25-coder-7b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-qwen25-coder-7b
+  template:
+    metadata:
+      labels:
+        app: vllm-qwen25-coder-7b
+    spec:
+      runtimeClassName: nvidia
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.6.3.post1
+          args:
+            - "--model"
+            - "/models/qwen25-coder-7b-awq"
+            - "--served-model-name"
+            - "qwen-coder"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+            - "--max-model-len"
+            - "8192"
+            - "--quantization"
+            - "awq"
+            - "--gpu-memory-utilization"
+            - "0.70"
+            - "--enforce-eager"
+          ports:
+          - containerPort: 8000
+            name: http
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: model-volume
+              mountPath: /models
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 180
+            periodSeconds: 30
+      volumes:
+        - name: model-volume
+          persistentVolumeClaim:
+            claimName: model-storage-claim
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-qwen25-coder-7b
+  namespace: ai-platform
+spec:
+  selector:
+    app: vllm-qwen25-coder-7b
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+  type: ClusterIP
