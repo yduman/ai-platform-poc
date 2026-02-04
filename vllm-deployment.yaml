@@ -29,12 +29,21 @@ spec:
             - "--port"
             - "8000"
             - "--max-model-len"
-            - "8192"
+            - "20480"
             - "--quantization"
             - "awq"
             - "--gpu-memory-utilization"
-            - "0.70"
+            - "0.80"
             - "--enforce-eager"
+            - "--enable-auto-tool-choice"
+            - "--tool-call-parser"
+            - "hermes"
+            - "--enable-chunked-prefill"
+            - "--max-num-seqs"
+            - "16"
+          env:
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "max_split_size_mb:512,expandable_segments:True"
           ports:
           - containerPort: 8000
             name: http
@@ -66,7 +75,7 @@ spec:
         - name: shm
           emptyDir:
             medium: Memory
-            sizeLimit: 4Gi
+            sizeLimit: 8Gi
 
 ---
 

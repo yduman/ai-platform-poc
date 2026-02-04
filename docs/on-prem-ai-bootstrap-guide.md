@@ -72,7 +72,7 @@ This is what we are building:
 ┌──────────────────────────────────────────────────────────────────┐
 │  Developer Machine                                               │
 │  ┌────────────────┐                                              │
-│  │   OpenCode     │──── HTTPS ──→ LiteLLM ──→ vLLM ──→ Model   │
+│  │   OpenCode     │──── HTTP ──→ LiteLLM ──→ vLLM ──→ Model     │
 │  │   (terminal)   │              (K3s Pod)    (K3s Pod) (GPU)    │
 │  └────────────────┘                                              │
 │  ┌────────────────┐                                              │
@@ -84,15 +84,26 @@ This is what we are building:
 ┌──────────────────────────────────────────────────────────────────┐
 │  K3s Cluster (single node to start)                              │
 │                                                                  │
-│  ┌─────────────────────┐    ┌─────────────────────────────────┐ │
-│  │  LiteLLM Pod         │    │  vLLM Pod                       │ │
-│  │  - API Gateway       │───→│  - Codestral 22B               │ │
-│  │  - Auth / Rate Limit │    │  - GPU: nvidia.com/gpu: 1      │ │
-│  │  - Usage Tracking    │    │  - Port 8000                   │ │
-│  │  - Port 4000         │    └─────────────────────────────────┘ │
-│  └─────────────────────┘                                         │
+│  ┌─────────────────────────────┐    ┌───────────────────────────┐│
+│  │  LiteLLM Pod                 │    │  vLLM Pod                 ││
+│  │  ┌─────────────────────────┐ │    │                           ││
+│  │  │ Token-Cap Proxy :4000   │ │    │  - Qwen 2.5 Coder 7B     ││
+│  │  │ (caps max_tokens to fit │─┼───→│  - GPU: nvidia.com/gpu: 1││
+│  │  │  available context)     │ │    │  - 20K context window     ││
+│  │  └───────────┬─────────────┘ │    │  - Port 8000              ││
+│  │              ▼               │    └───────────────────────────┘│
+│  │  ┌─────────────────────────┐ │                                 │
+│  │  │ LiteLLM :4001           │ │                                 │
+│  │  │ - API Gateway           │ │                                 │
+│  │  │ - Auth / Rate Limit     │ │                                 │
+│  │  └─────────────────────────┘ │                                 │
+│  └─────────────────────────────┘                                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+**Why the Token-Cap Proxy?**
+
+Some clients (like OpenCode) hardcode large `max_tokens` values (e.g., 32,000) that exceed the model's context window. The proxy intercepts requests, estimates input token count, and caps `max_tokens` to fit within available context space. This prevents `ContextWindowExceededError` without requiring client-side changes.
 
 ---
 
@@ -282,7 +293,7 @@ kubectl apply -f vllm-model-pv.yaml
 
 ### 5.3 Deploy vLLM
 
-> **Note**: If you're running a desktop environment (Xorg, Cinnamon, etc.), GUI apps consume GPU memory (often 2-4GB). Use the AWQ-quantized model and lower memory settings below. Check usage with `nvidia-smi`.
+> **Note**: If you're running a desktop environment (Xorg, Cinnamon, etc.), GUI apps consume GPU memory (often 2-4GB). The settings below are tuned for desktop use with ~12-13GB available VRAM.
 
 ```yaml
 # Save as: vllm-deployment.yaml
@@ -306,10 +317,10 @@ spec:
       runtimeClassName: nvidia
       containers:
         - name: vllm
-          image: vllm/vllm-openai:v0.6.3.post1    # Pin version for stability
+          image: vllm/vllm-openai:v0.6.3.post1
           args:
             - "--model"
-            - "/models/qwen25-coder-7b-awq"        # Use AWQ quantized model
+            - "/models/qwen25-coder-7b-awq"
             - "--served-model-name"
             - "qwen-coder"
             - "--host"
@@ -317,15 +328,24 @@ spec:
             - "--port"
             - "8000"
             - "--max-model-len"
-            - "8192"                              # Reduce if OOM (uses less KV cache)
+            - "20480"                             # 20K context (adjust based on VRAM)
             - "--quantization"
             - "awq"
             - "--gpu-memory-utilization"
-            - "0.70"                              # Lower if desktop apps use GPU
-            - "--enforce-eager"                   # Disable CUDA graphs (saves 1-3GB)
+            - "0.80"                              # 80% of available VRAM
+            - "--enforce-eager"                   # Disable CUDA graphs (saves memory)
+            - "--enable-auto-tool-choice"
+            - "--tool-call-parser"
+            - "hermes"
+            - "--enable-chunked-prefill"          # Better memory efficiency
+            - "--max-num-seqs"
+            - "16"                                # Limit concurrent requests
             # Uncomment for multi-GPU:
             # - "--tensor-parallel-size"
             # - "2"
+          env:
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "max_split_size_mb:512,expandable_segments:True"
           ports:
             - containerPort: 8000
               name: http
@@ -342,7 +362,7 @@ spec:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 120     # Models take time to load
+            initialDelaySeconds: 120
             periodSeconds: 10
           livenessProbe:
             httpGet:
@@ -357,7 +377,7 @@ spec:
         - name: shm
           emptyDir:
             medium: Memory
-            sizeLimit: 4Gi              # Shared memory for PyTorch
+            sizeLimit: 8Gi                        # Increased for larger context
 ---
 apiVersion: v1
 kind: Service
@@ -373,6 +393,17 @@ spec:
       name: http
   type: ClusterIP
 ```
+
+**Memory tuning guide:**
+
+| GPU Available VRAM | max-model-len | gpu-memory-utilization |
+|--------------------|---------------|------------------------|
+| 24GB (dedicated)   | 32768         | 0.90                   |
+| 16GB (dedicated)   | 24576         | 0.85                   |
+| 12-13GB (desktop)  | 20480         | 0.80                   |
+| 10-11GB (desktop)  | 16384         | 0.75                   |
+
+If you get OOM errors, reduce `max-model-len` first, then `gpu-memory-utilization`.
 
 ```bash
 kubectl apply -f vllm-deployment.yaml
@@ -446,10 +477,101 @@ data:
       database_url: null                 # Add PostgreSQL later for persistent logs
 ```
 
-### 6.2 Deploy LiteLLM
+### 6.2 Deploy LiteLLM with Token-Cap Proxy
+
+The deployment includes a Python sidecar proxy that intercepts requests and caps `max_tokens` to fit within the model's context window. This prevents `ContextWindowExceededError` from clients that hardcode large token values.
 
 ```yaml
 # Save as: litellm-deployment.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: token-cap-proxy
+  namespace: ai-platform
+data:
+  proxy.py: |
+    #!/usr/bin/env python3
+    """Simple proxy that caps max_tokens before forwarding to LiteLLM."""
+    import json
+    import http.client
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    MAX_CONTEXT = 20480   # Must match vLLM's max-model-len
+    MAX_OUTPUT = 8192     # Maximum output tokens to allow
+    BUFFER = 512          # Safety buffer for tokenization differences
+    LITELLM_PORT = 4001
+
+    class ProxyHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self._proxy_request()
+
+        def do_POST(self):
+            self._proxy_request()
+
+        def _proxy_request(self):
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length) if content_length > 0 else b''
+
+            if self.path.startswith('/v1/chat/completions') and body:
+                body = self._cap_max_tokens(body)
+
+            conn = http.client.HTTPConnection('127.0.0.1', LITELLM_PORT)
+            headers = {k: v for k, v in self.headers.items()
+                       if k.lower() not in ('host', 'content-length')}
+            headers['Content-Length'] = str(len(body))
+
+            try:
+                conn.request(self.command, self.path, body, headers)
+                resp = conn.getresponse()
+                self.send_response(resp.status)
+                for header, value in resp.getheaders():
+                    if header.lower() not in ('transfer-encoding',):
+                        self.send_header(header, value)
+                self.end_headers()
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except Exception as e:
+                self.send_error(502, f'Proxy error: {e}')
+            finally:
+                conn.close()
+
+        def _cap_max_tokens(self, body):
+            try:
+                data = json.loads(body)
+                input_chars = 0
+                for msg in data.get('messages', []):
+                    content = msg.get('content', '')
+                    if isinstance(content, str):
+                        input_chars += len(content)
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get('type') == 'text':
+                                input_chars += len(part.get('text', ''))
+
+                estimated_input = input_chars // 4  # ~4 chars per token
+                available = MAX_CONTEXT - estimated_input - BUFFER
+                available = max(100, min(available, MAX_OUTPUT))
+
+                requested = data.get('max_tokens', 0)
+                if requested > available:
+                    print(f'[TokenCap] {requested} -> {available} (input: ~{estimated_input})')
+                    data['max_tokens'] = available
+                return json.dumps(data).encode()
+            except Exception:
+                return body
+
+        def log_message(self, format, *args):
+            pass  # Suppress default logging
+
+    if __name__ == '__main__':
+        server = HTTPServer(('0.0.0.0', 4000), ProxyHandler)
+        print('Token-cap proxy listening on :4000 -> LiteLLM :4001')
+        server.serve_forever()
+
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -468,28 +590,46 @@ spec:
         app: litellm
     spec:
       containers:
+        - name: token-cap-proxy
+          image: python:3.11-slim
+          command: ["python", "/app/proxy.py"]
+          ports:
+            - containerPort: 4000
+              name: http
+          volumeMounts:
+            - name: proxy-script
+              mountPath: /app
+          readinessProbe:
+            tcpSocket:
+              port: 4000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
         - name: litellm
           image: ghcr.io/berriai/litellm:main-latest
           args:
             - "--config"
             - "/etc/litellm/config.yaml"
             - "--port"
-            - "4000"
+            - "4001"                              # Internal port (proxy on 4000)
             - "--num_workers"
             - "4"
-          ports:
-            - containerPort: 4000
-              name: http
           env:
             - name: LITELLM_MASTER_KEY
-              value: "sk-your-master-key-change-this"    # CHANGE THIS — match config
+              value: "sk-your-master-key-change-this"
           volumeMounts:
             - name: config
               mountPath: /etc/litellm
           readinessProbe:
             httpGet:
               path: /health/liveliness
-              port: 4000
+              port: 4001
             initialDelaySeconds: 10
             periodSeconds: 5
           resources:
@@ -503,6 +643,9 @@ spec:
         - name: config
           configMap:
             name: litellm-config
+        - name: proxy-script
+          configMap:
+            name: token-cap-proxy
 ---
 apiVersion: v1
 kind: Service
@@ -517,6 +660,26 @@ spec:
       targetPort: 4000
       name: http
   type: ClusterIP
+```
+
+**How the proxy works:**
+
+```
+Client request (max_tokens: 32000)
+       │
+       ▼
+┌─────────────────────────┐
+│ Token-Cap Proxy (:4000) │
+│ 1. Parse JSON body      │
+│ 2. Estimate input tokens│
+│ 3. Cap max_tokens to fit│
+└───────────┬─────────────┘
+            │ (max_tokens: 9724)
+            ▼
+┌─────────────────────────┐
+│ LiteLLM (:4001)         │
+│ Routes to vLLM          │
+└─────────────────────────┘
 ```
 
 ### 6.3 Expose LiteLLM Outside the Cluster
@@ -869,9 +1032,11 @@ At this point all components should be running. Here is how to verify the full s
 
 ```bash
 kubectl -n ai-platform get pods
-# NAME                              READY   STATUS    RESTARTS   AGE
+# NAME                                   READY   STATUS    RESTARTS   AGE
 # vllm-qwen25-coder-7b-xxxxxxxxx-xxxxx   1/1     Running   0          10m
-# litellm-xxxxxxxxx-xxxxx           1/1     Running   0          5m
+# litellm-xxxxxxxxx-xxxxx                2/2     Running   0          5m
+#                                        ^^^
+#                                        2 containers: token-cap-proxy + litellm
 ```
 
 ### 9.2 Test the Full Chain from Terminal
@@ -994,6 +1159,43 @@ This is normal on first start — large models take 2-5 minutes to load into GPU
 kubectl -n ai-platform logs -f deployment/vllm-qwen25-coder-7b | grep -i "loading\|ready\|error"
 ```
 
+### ContextWindowExceededError
+
+**Symptom:**
+```
+litellm.ContextWindowExceededError: This model's maximum context length is 20480 tokens.
+However, you requested 42539 tokens (10539 in the messages, 32000 in the completion).
+```
+
+**Cause:** The client (e.g., OpenCode) sends a hardcoded `max_tokens` value (often 32000) that, combined with the input prompt, exceeds vLLM's context window.
+
+**Solutions:**
+
+1. **Use the token-cap proxy** (recommended): The LiteLLM deployment in this guide includes a proxy sidecar that automatically caps `max_tokens` to fit available context. Make sure you're using the deployment from section 6.2.
+
+2. **Increase vLLM context window**: If you have more VRAM available:
+   ```yaml
+   args:
+     - "--max-model-len"
+     - "32768"                    # Requires ~14GB free VRAM
+     - "--gpu-memory-utilization"
+     - "0.90"
+   ```
+
+3. **Reduce input size**: If using OpenCode, disable features that add large system prompts, or configure smaller context in `AGENTS.md`.
+
+**Verify the proxy is working:**
+```bash
+# Check proxy logs
+kubectl -n ai-platform logs deployment/litellm -c token-cap-proxy
+
+# Test with a large max_tokens value (should succeed)
+curl http://localhost:30400/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-local-dev" \
+  -d '{"model": "qwen-coder", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 32000}'
+```
+
 ---
 
 ## 11. Next Steps
@@ -1051,7 +1253,8 @@ Set up MCP servers for Jira, Confluence, and GitLab so that coding agents and Li
 | K3s status | `sudo systemctl status k3s` |
 | All AI pods | `kubectl -n ai-platform get pods` |
 | vLLM logs | `kubectl -n ai-platform logs -f deploy/vllm-qwen25-coder-7b` |
-| LiteLLM logs | `kubectl -n ai-platform logs -f deploy/litellm` |
+| LiteLLM logs | `kubectl -n ai-platform logs -f deploy/litellm -c litellm` |
+| Token-cap proxy logs | `kubectl -n ai-platform logs -f deploy/litellm -c token-cap-proxy` |
 | LiteLLM health | `curl http://<node-ip>:30400/health/liveliness` |
 | vLLM health | `kubectl -n ai-platform port-forward svc/vllm-qwen25-coder-7b 8000:8000` then `curl localhost:8000/health` |
 | List models | `curl -H "Authorization: Bearer <key>" http://<node-ip>:30400/v1/models` |
@@ -1062,4 +1265,4 @@ Set up MCP servers for Jira, Confluence, and GitLab so that coding agents and Li
 ---
 
 *Last updated: February 2026*
-*Architecture version: 1.0 — Single node K3s with Qwen Coder on vLLM*
+*Architecture version: 1.1 — Single node K3s with Qwen Coder on vLLM + Token-Cap Proxy*

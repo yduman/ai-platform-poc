@@ -13,31 +13,34 @@
 │  │   │         LiteLLM Pod            │      │     vllm-qwen25-coder-7b Pod   │ │   │
 │  │   │                                │      │                                │ │   │
 │  │   │  ┌──────────────────────────┐  │      │  ┌──────────────────────────┐  │ │   │
-│  │   │  │    LiteLLM Container     │  │      │  │     vLLM Container       │  │ │   │
-│  │   │  │                          │  │      │  │                          │  │ │   │
-│  │   │  │  - API Gateway           │  │      │  │  --model /models/qwen..  │  │ │   │
-│  │   │  │  - Routes requests       │  │      │  │  --quantization awq      │  │ │   │
-│  │   │  │  - Auth (master_key)     │  │      │  │  --max-model-len 8192    │  │ │   │
-│  │   │  │                          │  │      │  │                          │  │ │   │
-│  │   │  │  Port 4000               │  │      │  │  Port 8000               │  │ │   │
-│  │   │  └──────────────────────────┘  │      │  └────────────┬─────────────┘  │ │   │
-│  │   │               │                │      │               │                │ │   │
-│  │   │               │ ConfigMap:     │      │               │ Volume:        │ │   │
-│  │   │               │ litellm-config │      │               │ /models (RO)   │ │   │
-│  │   └───────────────┼────────────────┘      └───────────────┼────────────────┘ │   │
-│  │                   │                                       │                  │   │
-│  │                   ▼                                       ▼                  │   │
+│  │   │  │  Token-Cap Proxy :4000   │  │      │  │     vLLM Container       │  │ │   │
+│  │   │  │  - Caps max_tokens       │  │      │  │                          │  │ │   │
+│  │   │  │  - Prevents overflow     │  │      │  │  --model /models/qwen..  │  │ │   │
+│  │   │  └───────────┬──────────────┘  │      │  │  --quantization awq      │  │ │   │
+│  │   │              │                 │      │  │  --max-model-len 20480   │  │ │   │
+│  │   │              ▼                 │      │  │  --gpu-memory-util 0.80  │  │ │   │
+│  │   │  ┌──────────────────────────┐  │      │  │  --enable-chunked-prefill│  │ │   │
+│  │   │  │  LiteLLM Container :4001 │  │      │  │                          │  │ │   │
+│  │   │  │  - API Gateway           │──┼──────┼─▶│  Port 8000               │  │ │   │
+│  │   │  │  - Routes requests       │  │      │  └────────────┬─────────────┘  │ │   │
+│  │   │  │  - Auth (master_key)     │  │      │               │                │ │   │
+│  │   │  └──────────────────────────┘  │      │               │ Volume:        │ │   │
+│  │   │               │ ConfigMaps:    │      │               │ /models (RO)   │ │   │
+│  │   │               │ litellm-config │      │               │ /dev/shm 8Gi   │ │   │
+│  │   │               │ token-cap-proxy│      │                                │ │   │
+│  │   └───────────────┼────────────────┘      └────────────────────────────────┘ │   │
+│  │                   │                                                          │   │
+│  │                   ▼                                                          │   │
 │  │   ┌────────────────────────────────────┐  ┌────────────────────────────────┐ │   │
 │  │   │ Service: litellm (ClusterIP)       │  │ Service: vllm-qwen25-coder-7b  │ │   │
-│  │   │ port: 4000                         │  │ (ClusterIP) port: 8000         │ │   │
+│  │   │ port: 4000 → proxy container       │  │ (ClusterIP) port: 8000         │ │   │
 │  │   └────────────────────────────────────┘  └────────────────────────────────┘ │   │
-│  │                   │                                       ▲                  │   │
-│  │                   │                                       │                  │   │
-│  │   ┌───────────────▼────────────────────┐                  │                  │   │
-│  │   │ Service: litellm-nodeport          │    LiteLLM calls vLLM via:          │   │
-│  │   │ type: NodePort                     │    http://vllm-qwen25-coder-7b      │   │
-│  │   │ nodePort: 30400                    │      .ai-platform.svc.cluster.local │   │
-│  │   └────────────────────────────────────┘      :8000/v1                       │   │
+│  │                   │                                                          │   │
+│  │   ┌───────────────▼────────────────────┐                                     │   │
+│  │   │ Service: litellm-nodeport          │                                     │   │
+│  │   │ type: NodePort                     │                                     │   │
+│  │   │ nodePort: 30400                    │                                     │   │
+│  │   └────────────────────────────────────┘                                     │   │
 │  │                                                                              │   │
 │  └──────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                     │
@@ -53,37 +56,56 @@
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │  Host                                                                               │
 │                                                                                     │
-│  /models/qwen25-coder-7b-awq/          NVIDIA GPU                                   │
+│  /models/qwen25-coder-7b-awq/          NVIDIA GPU (~12-13GB available on desktop)   │
 │    └── model weights                    └── vLLM inference                          │
 │                                                                                     │
-│  localhost:30400  ──────────────────►  LiteLLM  ──────────────────►  vLLM           │
-│  (NodePort)                            (gateway)                     (inference)    │
+│  localhost:30400  ───►  Token-Cap Proxy  ───►  LiteLLM  ───►  vLLM                  │
+│  (NodePort)             (caps max_tokens)      (gateway)       (inference)          │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Request Flow
 
 ```
-curl localhost:30400/v1/chat/completions
+curl localhost:30400/v1/chat/completions -d '{"max_tokens": 32000, ...}'
          │
          ▼
-    ┌─────────┐
-    │NodePort │  Host exposes port 30400
-    │ :30400  │
-    └────┬────┘
+    ┌──────────┐
+    │ NodePort │  Host exposes port 30400
+    │  :30400  │
+    └────┬─────┘
          │
          ▼
-    ┌─────────┐
-    │LiteLLM  │  Authenticates (sk-local-dev), routes to model
-    │ :4000   │
-    └────┬────┘
-         │  http://vllm-qwen25-coder-7b.ai-platform.svc.cluster.local:8000/v1
-         ▼
-    ┌─────────┐
-    │ vLLM    │  Runs inference on GPU, returns completion
-    │ :8000   │
-    └─────────┘
+    ┌──────────────────┐
+    │ Token-Cap Proxy  │  Intercepts request, estimates input tokens (~10K),
+    │      :4000       │  caps max_tokens to available space (32000 → 9724)
+    └────────┬─────────┘
+             │
+             ▼
+    ┌──────────────────┐
+    │    LiteLLM       │  Authenticates (sk-local-dev), routes to vLLM
+    │      :4001       │
+    └────────┬─────────┘
+             │  http://vllm-qwen25-coder-7b.ai-platform.svc.cluster.local:8000/v1
+             ▼
+    ┌──────────────────┐
+    │      vLLM        │  Runs inference on GPU (20K context), returns completion
+    │      :8000       │
+    └──────────────────┘
 ```
+
+### Why the Token-Cap Proxy?
+
+Some AI coding assistants (like OpenCode) hardcode large `max_tokens` values (e.g., 32,000) regardless of configuration. Combined with system prompts (~10K tokens), this exceeds vLLM's context window.
+
+The proxy solves this by:
+1. Parsing the JSON request body
+2. Estimating input token count (~4 chars per token)
+3. Calculating available output space: `MAX_CONTEXT - input_tokens - buffer`
+4. Capping `max_tokens` if it exceeds available space
+5. Forwarding the modified request to LiteLLM
+
+This is transparent to clients — they receive normal responses without errors.
 
 ## Kubernetes Resources
 

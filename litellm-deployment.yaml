@@ -1,3 +1,103 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: token-cap-proxy
+  namespace: ai-platform
+data:
+  proxy.py: |
+    #!/usr/bin/env python3
+    """Simple proxy that caps max_tokens before forwarding to LiteLLM."""
+    import json
+    import http.client
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse
+
+    MAX_CONTEXT = 20480
+    MAX_OUTPUT = 8192
+    BUFFER = 512
+    LITELLM_PORT = 4001
+
+    class ProxyHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self._proxy_request()
+
+        def do_POST(self):
+            self._proxy_request()
+
+        def _proxy_request(self):
+            # Read request body
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length) if content_length > 0 else b''
+
+            # Modify body if it's a chat completion request
+            if self.path.startswith('/v1/chat/completions') and body:
+                body = self._cap_max_tokens(body)
+
+            # Forward to LiteLLM
+            conn = http.client.HTTPConnection('127.0.0.1', LITELLM_PORT)
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in ('host', 'content-length')}
+            headers['Content-Length'] = str(len(body))
+
+            try:
+                conn.request(self.command, self.path, body, headers)
+                resp = conn.getresponse()
+
+                # Send response back
+                self.send_response(resp.status)
+                for header, value in resp.getheaders():
+                    if header.lower() not in ('transfer-encoding',):
+                        self.send_header(header, value)
+                self.end_headers()
+
+                # Stream response body
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except Exception as e:
+                self.send_error(502, f'Proxy error: {e}')
+            finally:
+                conn.close()
+
+        def _cap_max_tokens(self, body):
+            try:
+                data = json.loads(body)
+
+                # Estimate input tokens
+                input_chars = 0
+                for msg in data.get('messages', []):
+                    content = msg.get('content', '')
+                    if isinstance(content, str):
+                        input_chars += len(content)
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get('type') == 'text':
+                                input_chars += len(part.get('text', ''))
+
+                estimated_input = input_chars // 4
+                available = MAX_CONTEXT - estimated_input - BUFFER
+                available = max(100, min(available, MAX_OUTPUT))
+
+                requested = data.get('max_tokens', 0)
+                if requested > available:
+                    print(f'[TokenCap] Capping max_tokens: {requested} -> {available} (est input: {estimated_input})')
+                    data['max_tokens'] = available
+
+                return json.dumps(data).encode()
+            except Exception as e:
+                print(f'[TokenCap] Parse error: {e}')
+                return body
+
+        def log_message(self, format, *args):
+            print(f'{self.address_string()} - {format % args}')
+
+    if __name__ == '__main__':
+        server = HTTPServer(('0.0.0.0', 4000), ProxyHandler)
+        print(f'Token-cap proxy listening on port 4000, forwarding to LiteLLM on {LITELLM_PORT}')
+        server.serve_forever()
+
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,18 +116,36 @@ spec:
         app: litellm
     spec:
       containers:
+        - name: token-cap-proxy
+          image: python:3.11-slim
+          command: ["python", "/app/proxy.py"]
+          ports:
+            - containerPort: 4000
+              name: http
+          volumeMounts:
+            - name: proxy-script
+              mountPath: /app
+          readinessProbe:
+            tcpSocket:
+              port: 4000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
         - name: litellm
           image: ghcr.io/berriai/litellm:main-latest
           args:
             - "--config"
             - "/etc/litellm/config.yaml"
             - "--port"
-            - "4000"
+            - "4001"
             - "--num_workers"
             - "4"
-          ports:
-            - containerPort: 4000
-              name: http
           env:
             - name: LITELLM_MASTER_KEY
               value: "sk-local-dev"
@@ -37,7 +155,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /health/liveliness
-              port: 4000
+              port: 4001
             initialDelaySeconds: 10
             periodSeconds: 5
           resources:
@@ -51,6 +169,9 @@ spec:
         - name: config
           configMap:
             name: litellm-config
+        - name: proxy-script
+          configMap:
+            name: token-cap-proxy
 ---
 apiVersion: v1
 kind: Service
