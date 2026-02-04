@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: ai-platform
+data:
+  config.yaml: |
+    model_list:
+      - model_name: qwen-coder
+        litellm_params:
+          model: openai/qwen-coder
+          api_base: http://vllm-qwen25-coder-7b.ai-platform.svc.cluster.local:8000/v1
+          api_key: "none"
+    
+    litellm_settings:
+      drop_params: true
+      set_verbose: false
+      request_timeout: 120
+
+    general_settings:
+      master_key: "sk-local-dev"
+      database_url: null    # can add for example PG for persistent logs

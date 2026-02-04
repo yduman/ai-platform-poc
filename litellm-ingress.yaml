@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: litellm-ingress
+  namespace: ai-platform
+  annotations:
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  rules:
+    - host: litellm.yduman.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: litellm
+                port:
+                  number: 4000

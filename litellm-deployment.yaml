@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: ai-platform
+  labels:
+    app: litellm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      labels:
+        app: litellm
+    spec:
+      containers:
+        - name: litellm
+          image: ghcr.io/berriai/litellm:main-latest
+          args:
+            - "--config"
+            - "/etc/litellm/config.yaml"
+            - "--port"
+            - "4000"
+            - "--num_workers"
+            - "4"
+          ports:
+            - containerPort: 4000
+              name: http
+          env:
+            - name: LITELLM_MASTER_KEY
+              value: "sk-local-dev"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/litellm
+          readinessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 4000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+      volumes:
+        - name: config
+          configMap:
+            name: litellm-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: ai-platform
+spec:
+  selector:
+    app: litellm
+  ports:
+    - port: 4000
+      targetPort: 4000
+      name: http
+  type: ClusterIP

@@ -234,7 +234,7 @@ pipx install huggingface-hub
 
 # Download Qwen 2.5 Coder 7B AWQ (recommended for 16GB GPUs)
 # AWQ quantization reduces model size from ~14GB to ~5GB
-hf download Qwen/Qwen2.5-Coder-7B-Instruct-AWQ --local-dir /models/qwen-coder-7b-awq
+hf download Qwen/Qwen2.5-Coder-7B-Instruct-AWQ --local-dir /models/qwen25-coder-7b-awq
 
 # Alternative: Full precision model (requires ~14GB free VRAM, no desktop apps)
 # hf download Qwen/Qwen2.5-Coder-7B-Instruct --local-dir /models/qwen-coder-7b
@@ -289,19 +289,19 @@ kubectl apply -f vllm-model-pv.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: vllm-qwen
+  name: vllm-qwen25-coder-7b
   namespace: ai-platform
   labels:
-    app: vllm-qwen
+    app: vllm-qwen25-coder-7b
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: vllm-qwen
+      app: vllm-qwen25-coder-7b
   template:
     metadata:
       labels:
-        app: vllm-qwen
+        app: vllm-qwen25-coder-7b
     spec:
       runtimeClassName: nvidia
       containers:
@@ -309,7 +309,7 @@ spec:
           image: vllm/vllm-openai:v0.6.3.post1    # Pin version for stability
           args:
             - "--model"
-            - "/models/qwen-coder-7b-awq"         # Use AWQ quantized model
+            - "/models/qwen25-coder-7b-awq"        # Use AWQ quantized model
             - "--served-model-name"
             - "qwen-coder"
             - "--host"
@@ -362,11 +362,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: vllm-qwen
+  name: vllm-qwen25-coder-7b
   namespace: ai-platform
 spec:
   selector:
-    app: vllm-qwen
+    app: vllm-qwen25-coder-7b
   ports:
     - port: 8000
       targetPort: 8000
@@ -378,17 +378,17 @@ spec:
 kubectl apply -f vllm-deployment.yaml
 
 # Watch the pod come up (model loading can take 2-5 minutes)
-kubectl -n ai-platform logs -f deployment/vllm-qwen
+kubectl -n ai-platform logs -f deployment/vllm-qwen25-coder-7b
 
 # Wait for ready
-kubectl -n ai-platform wait --for=condition=available deployment/vllm-qwen --timeout=300s
+kubectl -n ai-platform wait --for=condition=available deployment/vllm-qwen25-coder-7b --timeout=300s
 ```
 
 ### 5.4 Verify vLLM is Serving
 
 ```bash
 # Port-forward to test locally
-kubectl -n ai-platform port-forward svc/vllm-qwen 8000:8000 &
+kubectl -n ai-platform port-forward svc/vllm-qwen25-coder-7b 8000:8000 &
 
 # Test the endpoint
 curl http://localhost:8000/v1/models
@@ -426,7 +426,7 @@ data:
       - model_name: qwen-coder
         litellm_params:
           model: openai/qwen-coder
-          api_base: http://vllm-qwen.ai-platform.svc.cluster.local:8000/v1
+          api_base: http://vllm-qwen25-coder-7b.ai-platform.svc.cluster.local:8000/v1
           api_key: "none"                # vLLM doesn't need a key internally
 
     # If you add more models later, add them here:
@@ -544,7 +544,7 @@ spec:
 
 ```bash
 kubectl apply -f litellm-nodeport.yaml
-# LiteLLM is now accessible at http://<node-ip>:30400
+# LiteLLM is now accessible at http://localhost:30400 (or http://<node-ip>:30400 from other machines)
 ```
 
 **Option B: K3s Traefik Ingress (production-ready)**
@@ -581,8 +581,8 @@ kubectl apply -f litellm-nodeport.yaml   # or litellm-ingress.yaml
 # Wait for ready
 kubectl -n ai-platform wait --for=condition=available deployment/litellm --timeout=60s
 
-# Test (adjust URL based on your exposure method)
-export LITELLM_URL="http://<node-ip>:30400"
+# Test (use localhost if running on the same machine, or node IP from other machines)
+export LITELLM_URL="http://localhost:30400"
 
 # List models
 curl $LITELLM_URL/v1/models \
@@ -623,41 +623,60 @@ curl $LITELLM_URL/key/generate \
 ### 7.1 Install OpenCode
 
 ```bash
-# Install via Go (recommended)
-go install github.com/opencode-ai/opencode@latest
+# Option A: Quick install script
+curl -fsSL https://opencode.ai/install | bash
 
-# Or download binary from releases
-# https://github.com/opencode-ai/opencode/releases
+# Option B: Homebrew (macOS/Linux)
+brew install anomalyco/tap/opencode
+
+# Option C: npm
+npm i -g opencode-ai@latest
+
+# Verify installation
+opencode --version
 ```
+
+> **Note**: See [github.com/anomalyco/opencode](https://github.com/anomalyco/opencode) for more installation options (Scoop, Chocolatey, Arch, Nix).
 
 ### 7.2 Configure OpenCode to Use Your LiteLLM
 
-Create a configuration file at `~/.config/opencode/config.json`:
+**Step 1**: Register the LiteLLM provider credentials. Run `opencode`, then inside the TUI:
+
+```
+/connect
+→ Select "Other"
+→ Provider ID: litellm
+→ API Key: sk-local-dev
+```
+
+This stores credentials in `~/.local/share/opencode/auth.json`.
+
+**Step 2**: Create a configuration file at `~/.config/opencode/opencode.json`:
 
 ```json
 {
   "provider": {
-    "type": "openai",
-    "apiKey": "sk-abc123-your-developer-key",
-    "baseUrl": "http://<node-ip>:30400/v1"
+    "litellm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LiteLLM (Local)",
+      "options": {
+        "baseURL": "http://localhost:30400/v1"
+      },
+      "models": {
+        "qwen-coder": {
+          "name": "Qwen 2.5 Coder 7B",
+          "context_length": 8192,
+          "max_output": 4096
+        }
+      }
+    }
   },
-  "model": {
-    "main": "qwen-coder",
-    "weak": "qwen-coder"
-  }
+  "model": "litellm/qwen-coder",
+  "small_model": "litellm/qwen-coder"
 }
 ```
 
-Alternatively, use environment variables:
-
-```bash
-# Add to your ~/.bashrc or ~/.zshrc
-export OPENAI_API_KEY="sk-abc123-your-developer-key"
-export OPENAI_BASE_URL="http://<node-ip>:30400/v1"
-
-# Reload
-source ~/.bashrc
-```
+> **Note**: Replace `localhost:30400` with your node IP if accessing from a different machine.
 
 ### 7.3 First Test — Run OpenCode
 
@@ -672,7 +691,7 @@ opencode
 # > Explain the structure of this project
 
 # OpenCode should:
-# 1. Send request to LiteLLM (http://<node-ip>:30400/v1)
+# 1. Send request to LiteLLM (http://localhost:30400/v1)
 # 2. LiteLLM routes to vLLM (qwen-coder)
 # 3. vLLM runs inference on GPU
 # 4. Response streams back through the chain
@@ -851,7 +870,7 @@ At this point all components should be running. Here is how to verify the full s
 ```bash
 kubectl -n ai-platform get pods
 # NAME                              READY   STATUS    RESTARTS   AGE
-# vllm-qwen-xxxxxxxxx-xxxxx         1/1     Running   0          10m
+# vllm-qwen25-coder-7b-xxxxxxxxx-xxxxx   1/1     Running   0          10m
 # litellm-xxxxxxxxx-xxxxx           1/1     Running   0          5m
 ```
 
@@ -859,15 +878,15 @@ kubectl -n ai-platform get pods
 
 ```bash
 # Step 1: Verify vLLM directly
-kubectl -n ai-platform port-forward svc/vllm-qwen 8000:8000 &
+kubectl -n ai-platform port-forward svc/vllm-qwen25-coder-7b 8000:8000 &
 curl -s http://localhost:8000/v1/models | jq .
 kill %1
 
 # Step 2: Verify LiteLLM → vLLM
-export LITELLM_URL="http://<node-ip>:30400"
+export LITELLM_URL="http://localhost:30400"
 curl -s $LITELLM_URL/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-your-master-key-change-this" \
+  -H "Authorization: Bearer sk-local-dev" \
   -d '{
     "model": "qwen-coder",
     "messages": [{"role": "user", "content": "Write a Python function that adds two numbers"}],
@@ -920,7 +939,7 @@ opencode "Add a multiply function and write a test for all three functions"
 
 ```bash
 # Check logs
-kubectl -n ai-platform logs deployment/vllm-qwen
+kubectl -n ai-platform logs deployment/vllm-qwen25-coder-7b
 
 # Common issues:
 # "CUDA out of memory" → Model too large for GPU. Use quantization or smaller model.
@@ -933,10 +952,10 @@ kubectl -n ai-platform logs deployment/vllm-qwen
 ```bash
 # Test DNS resolution inside the cluster
 kubectl -n ai-platform run debug --rm -it --image=curlimages/curl -- \
-  curl http://vllm-qwen.ai-platform.svc.cluster.local:8000/v1/models
+  curl http://vllm-qwen25-coder-7b.ai-platform.svc.cluster.local:8000/v1/models
 
 # If DNS fails, check the service exists:
-kubectl -n ai-platform get svc vllm-qwen
+kubectl -n ai-platform get svc vllm-qwen25-coder-7b
 ```
 
 ### OpenCode Gets Timeout or Connection Refused
@@ -972,7 +991,7 @@ kubectl -n kube-system delete pod -l name=nvidia-device-plugin-ds
 This is normal on first start — large models take 2-5 minutes to load into GPU memory. Once loaded, inference is fast. Check progress in vLLM logs:
 
 ```bash
-kubectl -n ai-platform logs -f deployment/vllm-qwen | grep -i "loading\|ready\|error"
+kubectl -n ai-platform logs -f deployment/vllm-qwen25-coder-7b | grep -i "loading\|ready\|error"
 ```
 
 ---
@@ -1031,13 +1050,13 @@ Set up MCP servers for Jira, Confluence, and GitLab so that coding agents and Li
 |------|-------------|
 | K3s status | `sudo systemctl status k3s` |
 | All AI pods | `kubectl -n ai-platform get pods` |
-| vLLM logs | `kubectl -n ai-platform logs -f deploy/vllm-qwen` |
+| vLLM logs | `kubectl -n ai-platform logs -f deploy/vllm-qwen25-coder-7b` |
 | LiteLLM logs | `kubectl -n ai-platform logs -f deploy/litellm` |
 | LiteLLM health | `curl http://<node-ip>:30400/health/liveliness` |
-| vLLM health | `kubectl -n ai-platform port-forward svc/vllm-qwen 8000:8000` then `curl localhost:8000/health` |
+| vLLM health | `kubectl -n ai-platform port-forward svc/vllm-qwen25-coder-7b 8000:8000` then `curl localhost:8000/health` |
 | List models | `curl -H "Authorization: Bearer <key>" http://<node-ip>:30400/v1/models` |
 | Generate API key | `curl -X POST http://<node-ip>:30400/key/generate -H "Authorization: Bearer <master-key>" -d '{"user_id":"alice"}'` |
-| Restart vLLM | `kubectl -n ai-platform rollout restart deploy/vllm-qwen` |
+| Restart vLLM | `kubectl -n ai-platform rollout restart deploy/vllm-qwen25-coder-7b` |
 | Restart LiteLLM | `kubectl -n ai-platform rollout restart deploy/litellm` |
 
 ---
